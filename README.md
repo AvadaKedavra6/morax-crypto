@@ -1386,12 +1386,6 @@ And please, for the love of everything that has ever been hashed:
 
 ---
 
-# License
-
-
-
----
-
 Made with <3, questionable amounts of caffeine and an unhealthy relationship with bitwise operators.
 
 Feel free to dm me on nanos discord server if you want explains, lessons on cryptography or if you want an another modules here.
