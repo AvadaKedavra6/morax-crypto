@@ -1,8 +1,14 @@
 # MCrypt
 
-A full OOP cryptography framework for [nanos world](https://nanos.world) written in Lua, exposed globally under the `MCrypt` namespace.
+A full OOP cryptography framework for [nanos world](https://nanos.world), written in Lua and exposed globally under the `MCrypt` namespace.
 
 > Made with <3 by Morax/Avada :)
+
+> **Why did I write my own cryptography library?**
+>
+> Because apparently I enjoy suffering.
+>
+> MCrypt is a self-contained cryptographic toolkit designed specifically for nanos world with an OOP API, byte-string compatibility, modern primitives and enough warnings to hopefully stop you from inventing your own encryption protocol at 3 AM.
 
 ---
 
@@ -10,6 +16,7 @@ A full OOP cryptography framework for [nanos world](https://nanos.world) written
 
 - [Installation & architecture](#installation--architecture)
 - [Security at a glance](#security-at-a-glance)
+- [Before you use this](#before-you-use-this)
 - [Which algorithm should I use?](#which-algorithm-should-i-use)
 - [MCrypt.Class](#mcryptclass)
 - [MCrypt.Utility](#mcryptutility)
@@ -37,12 +44,17 @@ A full OOP cryptography framework for [nanos world](https://nanos.world) written
 - [MCrypt.Sign](#mcryptsign)
   - [EdDSA](#mcryptsigneddsa)
 - [The "byte string" convention](#the-byte-string-convention)
+- [Validation & test vectors](#validation--test-vectors)
+- [Limitations](#limitations)
+- [License](#license)
 
 ---
 
 ## Installation & architecture
 
-```
+MCrypt is designed to live as a nanos world package:
+
+```text
 Packages/mcrypt/
 ├── Package.toml
 ├── Server/
@@ -79,678 +91,1309 @@ Packages/mcrypt/
             └── EdDSA.lua
 ```
 
-`MCrypt` is exposed globally (`_G.MCrypt`) and via `Package.Export("MCrypt", MCrypt)` as soon as `Shared/Index.lua` has loaded so it's directly usable from any Client/Server/Shared file in this package or in any other package that depends on it.
+Once `Shared/Index.lua` has loaded, MCrypt is exposed globally as:
+
+```lua
+_G.MCrypt
+```
+
+and exported through:
+
+```lua
+Package.Export("MCrypt", MCrypt)
+```
+
+This means it can be used directly from the package's Client/Server/Shared code and by packages depending on it.
 
 ```lua
 local hash = MCrypt.Hash.SHA2.SHA256("Hello World!")
+print(hash)
 ```
 
-**Runtime assumption**: Lua 5.4 (native 64-bit integers, bitwise operators `& | ~ << >>`).
+### Runtime requirements
+
+MCrypt assumes **Lua 5.4** with:
+
+- native 64-bit integers
+- native bitwise operators:
+  - `&`
+  - `|`
+  - `~`
+  - `<<`
+  - `>>`
+- binary-safe Lua strings
+
+Some parts of `Utility.Random` use Lua's `os` library. Depending on your nanos world server configuration, this may require the appropriate unsafe-library setting.
 
 ---
 
-## Security at a glance
+# Security at a glance
 
-Read this table before picking an algorithm. "Bits" always refers to the **key** unless stated otherwise.
+Read this before choosing an algorithm.
+
+Seriously.
+
+Most cryptographic disasters happen because someone sees a function called `Encrypt()` and immediately uses it for passwords, authentication, save data, network packets, lunch and probably their taxes.
+
+"Bits" refers to the key size unless stated otherwise.
 
 | Module | Rating | Key size | IV / Nonce size | Output / Tag size | Notes |
 |---|:---:|---|---|---|---|
-| `Encrypt.AEAD` (ChaCha20-Poly1305) | ✅ **Secure recommended default** | 32 bytes (256-bit) | 12 bytes (96-bit) | 16-byte tag | Confidentiality **and** integrity in one call. Prefer this over raw `AES`/`ChaCha20` unless you have a specific reason not to. |
-| `Encrypt.AES` (CBC / CTR) | ✅ Secure **but no built-in authentication** | 16 / 24 / 32 bytes (128 / 192 / 256-bit) | 16 bytes (128-bit) | - | Pair with `Hash.HMAC` (encrypt-then-MAC) if you use raw AES and need tamper detection. `AEAD` already does this for you. |
-| `Encrypt.ChaCha20` | ✅ Secure **but no built-in authentication** | 32 bytes (256-bit) | 12 bytes (96-bit) | - | Same caveat as AES pair with `Hash.HMAC` or just use `AEAD`. |
-| `Encrypt.XOR` | ❌ **Not secure** | any length | - | - | Trivially broken by frequency analysis / known-plaintext attacks. Light obfuscation only, **never** use for anything that actually needs to stay secret. |
-| `Sign.EdDSA` (Ed25519) | ✅ Secure | 32-byte public / 64-byte private | - | 64-byte signature | Industry-standard signature scheme. Good for player identity, auth tokens, save-data integrity proofs. |
-| `Hash.SHA2` / `SHA512` / `SHA3` / `BLAKE3` | ✅ Secure (as general-purpose hashes) | - | - | 28–64 bytes (variant-dependent) | **Not** suitable for password storage as-is (see below), they're fast by design which is the opposite of what password hashing needs. |
-| `Hash.HMAC` / `KMAC` | ✅ Secure MAC | any length (≥ block size recommended) | - | 32–64 bytes (configurable for KMAC) | Use to authenticate messages / verify integrity when both sides share a secret key. |
-| `Hash.Poly1305` | ✅ Secure, **one-time only** | 32 bytes (256-bit) | - | 16-byte tag | Never reuse a key across two different messages this breaks the security proof entirely. Already used correctly internally by `Encrypt.AEAD`, use the raw module directly only if you know what you're doing. |
-| `Hash.MD5` | ❌ **Cryptographically broken** | - | - | 16 bytes (128-bit) | Practical collision attacks exist. Legacy interop / non-security checksums **only** never for passwords, signatures or integrity you actually rely on. |
-| `Checksum.CRC32` / `Adler32` | ⚠️ **Not cryptographic at all** | - | - | 4 bytes (32-bit) | Designed to catch accidental corruption (bad downloads, disk errors), not tampering by an adversary. Trivial to forge on purpose. |
-| `Utility.Random` | ⚠️ Software PRNG, **not a hardware CSPRNG** | - | - | - | Fine for nonces, salts, session IDs. Be aware nanos world's Lua doesn't expose an OS-level CSPRNG, so this mixes multiple entropy sources as a best effort it is not a formally proven unpredictable source. |
-
-### ⚠️ Important: password storage
-
-**None of the hash functions in this framework (`SHA2`, `SHA512`, `SHA3`, `BLAKE3`, `MD5`) are appropriate for hashing player passwords.** They're all *fast* cryptographic hashes great for integrity/fingerprinting, terrible for passwords, because a fast hash lets an attacker who steals your database brute-force it at billions of guesses per second on commodity hardware. Password hashing needs a deliberately *slow*, memory-hard algorithm (Argon2, scrypt, bcrypt), **none of which are currently implemented in MCrypt**. If you need to store player credentials, use a dedicated password-hashing library/service or keep using platform-native auth (Steam/Epic) instead of storing passwords yourself. `Sign.EdDSA` (challenge-response, see the example further down) is the recommended way to authenticate players within MCrypt, since it avoids storing any password-equivalent secret server-side at all.
+| `Encrypt.AEAD` (ChaCha20-Poly1305) | ✅ **Recommended** | 32 bytes / 256-bit | 12 bytes / 96-bit | 16-byte tag | Confidentiality + integrity/authentication in one construction. Recommended default for new encryption use cases. |
+| `Encrypt.AES` (CBC / CTR) | ✅ Secure, **unauthenticated** | 16 / 24 / 32 bytes | 16 bytes | - | Confidentiality only. Use an appropriate MAC construction if authentication is required, or use AEAD instead. |
+| `Encrypt.ChaCha20` | ✅ Secure, **unauthenticated** | 32 bytes / 256-bit | 12 bytes / 96-bit | - | Confidentiality only. Never reuse a `(key, nonce)` pair. Prefer AEAD when authentication is required. |
+| `Encrypt.XOR` | ❌ **Not secure** | Any non-empty length | - | - | Repeating-key XOR. Obfuscation only. Do not use it as encryption. |
+| `Sign.EdDSA` (Ed25519) | ✅ Secure | 32-byte public / 64-byte private | - | 64-byte signature | Digital signatures. Useful for authentication, identity and integrity proofs. |
+| `Hash.SHA2` / `SHA512` / `SHA3` / `BLAKE3` | ✅ Secure | - | - | Variant-dependent | General-purpose cryptographic hashes. **Not password hashes.** |
+| `Hash.HMAC` / `KMAC` | ✅ Secure MAC | Variable | - | Variant-dependent | Message authentication using a shared secret. |
+| `Hash.Poly1305` | ⚠️ **One-time use** | 32 bytes / 256-bit | - | 16-byte tag | Never reuse the same Poly1305 key for different messages. |
+| `Hash.MD5` | ❌ **Broken** | - | - | 16 bytes / 128-bit | Legacy compatibility only. |
+| `Checksum.CRC32` / `Adler32` | ⚠️ **Not cryptographic** | - | - | 4 bytes / 32-bit | Detects accidental corruption, not malicious modification. |
+| `Utility.Random` | ⚠️ **Software PRNG** | - | - | - | Not an OS-backed CSPRNG. Suitable for many game-oriented uses but do not describe it as a formally cryptographically secure random source. |
 
 ---
 
-## Which algorithm should I use?
+# Before you use this
+
+MCrypt implements cryptographic primitives.
+
+That does **not** automatically make every system you build with those primitives secure.
+
+For example:
+
+```lua
+AES(key, "CBC")
+```
+
+is cryptographically valid.
+
+This:
+
+```text
+AES-CBC + hardcoded key + reused IV + no authentication
+```
+
+is still a terrible security design.
+
+The primitive isn't the problem.
+
+Your protocol is.
+
+### Some important rules
+
+- Never reuse a ChaCha20 `(key, nonce)` pair.
+- Never reuse an AEAD `(key, nonce)` pair.
+- Never reuse a Poly1305 one-time key.
+- Never use MD5 for security.
+- Never use CRC32 as an anti-cheat mechanism.
+- Never use Base64 as encryption.
+- Never use XOR as real encryption.
+- Never store passwords using SHA-256/SHA-512/BLAKE3/etc.
+- Never hardcode long-term secrets in client-side code and expect them to remain secret.
+- Never invent your own cryptographic protocol unless you have a very good reason.
+- Prefer authenticated encryption when you need both confidentiality and integrity.
+
+And perhaps the most important one:
+
+> **If you are not sure which primitive you need, you probably want `Encrypt.AEAD`.**
+
+---
+
+# Password storage
+
+## ⚠️ Do not hash passwords with MCrypt's normal hash functions
+
+None of the following are suitable password-hashing algorithms:
+
+```text
+SHA2
+SHA512
+SHA3
+BLAKE3
+MD5
+```
+
+They are intentionally fast.
+
+That is great for hashing files.
+
+It is terrible for passwords.
+
+Password storage should use a deliberately expensive password-hashing / KDF algorithm such as:
+
+- Argon2
+- scrypt
+- bcrypt
+
+These are **not currently implemented by MCrypt (coming soon)**.
+
+If you are building a player authentication system, prefer the platform's existing identity/authentication mechanisms where possible (Steam/Epic).
+
+For custom authentication, Ed25519 challenge-response can also be used without transmitting or storing a password-equivalent secret on the server.
+
+---
+
+# Which algorithm should I use?
 
 | I need to... | Use |
 |---|---|
-| Encrypt player save data / sensitive config at rest | `Encrypt.AEAD` (confidentiality + integrity in one call) |
-| Encrypt a network payload where you already have your own integrity check | `Encrypt.AES` (CTR for streaming, CBC otherwise) or `Encrypt.ChaCha20` |
-| Authenticate a player without storing a password | `Sign.EdDSA` (challenge-response) |
-| Verify a message wasn't tampered with, using a shared secret | `Hash.HMAC` or `Hash.KMAC` |
-| Fingerprint/deduplicate data, generate a content hash | `Hash.BLAKE3` (fastest of the secure hashes) or `Hash.SHA2`/`SHA3` |
-| Derive a subkey from a master secret | `Hash.BLAKE3.DeriveKey` |
-| Detect *accidental* corruption (not tampering) | `Checksum.CRC32` or `Checksum.Adler32` |
-| Generate a random token, nonce or salt | `Utility.Random.Bytes` / `.String` |
-| Match an external system's MD5 checksums (legacy interop) | `Hash.MD5` and nothing else |
-| Lightly obfuscate non-sensitive data (not a security boundary) | `Encrypt.XOR` and nothing sensitive |
+| Encrypt sensitive data with authentication | `Encrypt.AEAD` |
+| Encrypt data where I specifically need AES | `Encrypt.AES` |
+| Encrypt a stream and already have authentication handled separately | `Encrypt.ChaCha20` |
+| Authenticate a message with a shared secret | `Hash.HMAC` or `Hash.KMAC` |
+| Generate a content hash | `Hash.BLAKE3`, `Hash.SHA2`, or `Hash.SHA3` |
+| Derive a purpose-specific key | `Hash.BLAKE3.DeriveKey` |
+| Authenticate a player using public-key cryptography | `Sign.EdDSA` |
+| Detect accidental corruption | `Checksum.CRC32` or `Checksum.Adler32` |
+| Generate a nonce, token or salt | `Utility.Random.Bytes` |
+| Match an old system using MD5 | `Hash.MD5` |
+| Lightly obfuscate non-sensitive data | `Encrypt.XOR` |
 
 ---
 
-## MCrypt.Class
+# MCrypt.Class
 
-Internal OOP engine used by every stateful module (`AES`, `ChaCha20`, `XOR`, `EdDSA.Key`, `BLAKE3`, `Cipher`).
+Internal OOP engine used by stateful MCrypt modules.
+
+It provides lightweight class creation and inheritance without requiring an external framework.
 
 | Method | Description |
 |---|---|
-| `MCrypt.Class.New(name, parent?)` | Creates a new class. `parent` is optional, for inheritance. Instances are created by calling the class like a function: `MyClass(...)` which automatically invokes `Constructor` if defined. |
-| `MCrypt.Class.Is(instance, class)` | Returns `true` if `instance` is an instance of `class` (or a parent class in the inheritance chain). |
-| `MCrypt.Class.GetName(obj)` | Returns the name (string) of a class or instance. |
+| `MCrypt.Class.New(name, parent?)` | Creates a class. |
+| `MCrypt.Class.Is(instance, class)` | Checks whether an object belongs to a class or its inheritance chain. |
+| `MCrypt.Class.GetName(obj)` | Returns the class name. |
 
-**Example** defining your own class, with inheritance:
+### Example
 
 ```lua
 local Animal = MCrypt.Class.New("Animal")
+
 function Animal:Constructor(name)
-	self.Name = name
+    self.Name = name
 end
+
 function Animal:Speak()
-	return self.Name .. " makes a sound."
+    return self.Name .. " makes a sound."
 end
 
 local Dog = MCrypt.Class.New("Dog", Animal)
+
 function Dog:Speak()
-	return self.Name .. " barks."
+    return self.Name .. " barks."
 end
 
 local rex = Dog("Rex")
-print(rex:Speak()) -- "Rex barks."
-print(MCrypt.Class.Is(rex, Animal)) -- true (inherited)
-print(MCrypt.Class.Is(rex, Dog)) -- true
-print(MCrypt.Class.GetName(rex)) -- "Dog"
+
+print(rex:Speak())
+-- Rex barks.
+
+print(MCrypt.Class.Is(rex, Animal))
+-- true
+
+print(MCrypt.Class.Is(rex, Dog))
+-- true
+
+print(MCrypt.Class.GetName(rex))
+-- Dog
 ```
 
 ---
 
-## MCrypt.Utility
+# MCrypt.Utility
 
-### MCrypt.Utility.Conversions
+## MCrypt.Utility.Conversions
 
-Byte-string <> hex <> byte-array conversions. See [The "byte string" convention](#the-byte-string-convention).
+Utilities for converting between:
+
+- byte strings
+- hexadecimal strings
+- byte arrays
+
+See [The "byte string" convention](#the-byte-string-convention).
 
 | Method | Signature | Description |
 |---|---|---|
-| `ToHex` | `(data: string) > hex: string` | Converts a byte string to lowercase hex. |
-| `FromHex` | `(hex: string) > data: string` | Converts a hex string (even length) back to a byte string. |
-| `ToByteArray` | `(data: string) > bytes: integer[]` | Converts to an array of numeric values (0-255). |
-| `FromByteArray` | `(bytes: integer[]) > data: string` | Reverse operation. |
-| `ByteToHex` | `(value: integer) > hex: string` | Converts a single byte (0-255) to a 2-character hex string. |
+| `ToHex` | `(data: string) -> hex: string` | Converts a byte string to lowercase hexadecimal. |
+| `FromHex` | `(hex: string) -> data: string` | Converts hexadecimal back to a byte string. |
+| `ToByteArray` | `(data: string) -> bytes: integer[]` | Converts bytes to numeric values from 0–255. |
+| `FromByteArray` | `(bytes: integer[]) -> data: string` | Converts a byte array back to a byte string. |
+| `ByteToHex` | `(value: integer) -> hex: string` | Converts one byte to a two-character hexadecimal value. |
 
-**Example**:
+### Example
 
 ```lua
 local Conversions = MCrypt.Utility.Conversions
-
 local hex = Conversions.ToHex("Hello!")
-print(hex) -- "48656c6c6f21"
+
+print(hex)
+-- 48656c6c6f21
 
 local back = Conversions.FromHex(hex)
-print(back) -- "Hello!"
+
+print(back)
+-- Hello!
 
 local bytes = Conversions.ToByteArray("AB")
-print(bytes[1], bytes[2]) -- 65  66
 
-print(Conversions.FromByteArray(bytes)) -- "AB"
-print(Conversions.ByteToHex(255)) -- "ff"
-```
+print(bytes[1], bytes[2])
+-- 65  66
 
-### MCrypt.Utility.Random
+print(Conversions.FromByteArray(bytes))
+-- AB
 
-⚠️ Software PRNG (mixes several entropy sources) **not a hardware CSPRNG**. Good enough for nonces/salts/IDs, reconsider if you need provably unpredictable long-term key material.
-
-| Method | Signature | Description |
-|---|---|---|
-| `Bytes` | `(length: integer) > data: string` | Generates `length` random bytes. |
-| `String` | `(length: integer, alphabet?: string) > string` | Random string (alphanumeric by default). |
-| `Integer` | `(min: integer, max: integer) > integer` | Random inclusive integer. |
-
-**Example**:
-
-```lua
-local Random = MCrypt.Utility.Random
-
-local nonce = Random.Bytes(12) -- e.g. for Encrypt.AEAD / Encrypt.ChaCha20
-print(MCrypt.Utility.Conversions.ToHex(nonce))
-
-local sessionToken = Random.String(24)
-print(sessionToken) -- e.g. "aZ9kLp3QeR7mT1nX4bV8cWy2"
-
-local diceRoll = Random.Integer(1, 6)
-print(diceRoll) -- e.g. 4
-
--- custom alphabet, e.g. a numeric-only PIN
-print(Random.String(6, "0123456789")) -- e.g. "042817"
-```
-
-### MCrypt.Utility.Base64
-
-Standard RFC 4648 (alphabet `A-Za-z0-9+/`, `=` padding). Not encryption this is an encoding, providing zero confidentiality.
-
-| Method | Signature | Description |
-|---|---|---|
-| `Encode` | `(data: string) > encoded: string` | Encodes a byte string as Base64. |
-| `Decode` | `(encoded: string) > data: string` | Decodes Base64 back to a byte string. |
-
-**Example**:
-
-```lua
-local Base64 = MCrypt.Utility.Base64
-
-local encoded = Base64.Encode("Hello World!")
-print(encoded) -- "SGVsbG8gV29ybGQh"
-
-local decoded = Base64.Decode(encoded)
-print(decoded) -- "Hello World!"
+print(Conversions.ByteToHex(255))
+-- ff
 ```
 
 ---
 
-## MCrypt.Hash
+## MCrypt.Utility.Random
 
-### MCrypt.Hash.SHA2
+MCrypt's random utility provides a software PRNG designed for nanos world environments.
 
-✅ Secure. SHA-224 / SHA-256 (FIPS 180-4).
+It is **not an OS-backed CSPRNG**.
 
-| Method | Signature | Output size | Description |
-|---|---|---|---|
-| `SHA256` | `(message: string, salt?: string) > hex` | 32 bytes / 256-bit (64 hex chars) | `salt` if given, is appended after the message before hashing. |
-| `SHA224` | `(message: string, salt?: string) > hex` | 28 bytes / 224-bit (56 hex chars) | |
+It mixes multiple available entropy sources, but this should not be confused with a formally verified cryptographic randomness source.
 
-**Example**:
+Use it for things such as:
 
-```lua
-print(MCrypt.Hash.SHA2.SHA256("Hello World!"))
--- "7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d906"
+- nonces
+- salts
+- temporary IDs
+- game tokens
+- procedural randomness
 
--- salted (e.g. before storing a fingerprint, NOT for passwords, see the warning above)
-print(MCrypt.Hash.SHA2.SHA256("Hello World!", "some-salt"))
+Be more careful when generating long-term cryptographic key material.
 
-print(MCrypt.Hash.SHA2.SHA224("Hello World!"))
-```
+| Method | Signature | Description |
+|---|---|---|
+| `Bytes` | `(length: integer) > data: string` | Generates random bytes. |
+| `String` | `(length: integer, alphabet?: string) > string` | Generates a random string. |
+| `Integer` | `(min: integer, max: integer) > integer` | Generates an inclusive random integer. |
 
-### MCrypt.Hash.SHA512
-
-✅ Secure. SHA-384 / SHA-512 (FIPS 180-4, 64-bit word variant).
-
-| Method | Signature | Output size | Description |
-|---|---|---|---|
-| `SHA512` | `(message: string, salt?: string) > hex` | 64 bytes / 512-bit (128 hex chars) | |
-| `SHA384` | `(message: string, salt?: string) > hex` | 48 bytes / 384-bit (96 hex chars) | |
-
-**Example**:
+### Example
 
 ```lua
-print(MCrypt.Hash.SHA512.SHA512("Hello World!"))
-print(MCrypt.Hash.SHA512.SHA384("Hello World!"))
+local Random = MCrypt.Utility.Random
+local nonce = Random.Bytes(12)
+local sessionToken = Random.String(24)
+local diceRoll = Random.Integer(1, 6)
+
+print(diceRoll)
+-- e.g. 4
+
+print(Random.String(6, "0123456789"))
+-- e.g. 042817
 ```
 
-### MCrypt.Hash.SHA3
+---
 
-✅ Secure. Keccak-f[1600] / FIPS 202. Includes fixed-output SHA-3 and SHAKE (extendable-output).
+## MCrypt.Utility.Base64
 
-| Method | Signature | Output size | Description |
-|---|---|---|---|
-| `SHA3_224` | `(message: string) > hex` | 28 bytes / 224-bit | |
-| `SHA3_256` | `(message: string) > hex` | 32 bytes / 256-bit | |
-| `SHA3_384` | `(message: string) > hex` | 48 bytes / 384-bit | |
-| `SHA3_512` | `(message: string) > hex` | 64 bytes / 512-bit | |
-| `SHAKE128` | `(message: string, outputBytes: integer) > hex` | your choice | XOF output length is free. |
-| `SHAKE256` | `(message: string, outputBytes: integer) > hex` | your choice | XOF output length is free. |
+Standard RFC 4648 Base64 encoding.
 
-`MCrypt.Hash.SHA3.Internal` also exposes the raw Keccak/cSHAKE primitives (`CShakeRaw`, `LeftEncode`, `RightEncode`, `EncodeString`, `BytePad`, `ToHex`) internal use only (consumed by `Hash.KMAC`), not a stable API for direct consumption.
+And no:
 
-**Example**:
+> Base64 is not encryption.
+
+It is encoding.
+
+Anyone can decode it.
+
+```lua
+local Base64 = MCrypt.Utility.Base64
+local encoded = Base64.Encode("Hello World!")
+
+print(encoded)
+-- SGVsbG8gV29ybGQh
+
+local decoded = Base64.Decode(encoded)
+
+print(decoded)
+-- Hello World!
+```
+
+---
+
+# MCrypt.Hash
+
+## MCrypt.Hash.SHA2
+
+SHA-224 and SHA-256.
+
+Based on FIPS 180-4.
+
+| Method | Signature | Output |
+|---|---|---|
+| `SHA256` | `(message: string, salt?: string) > hex` | 32 bytes / 256-bit |
+| `SHA224` | `(message: string, salt?: string) > hex` | 28 bytes / 224-bit |
+
+If a salt is supplied, it is appended to the message before hashing.
+
+```lua
+local SHA2 = MCrypt.Hash.SHA2
+
+print(SHA2.SHA256("Hello World!"))
+print(SHA2.SHA224("Hello World!"))
+print(SHA2.SHA256("Hello World!", "some-salt"))
+```
+
+Again:
+
+> A salt does not magically turn SHA-256 into a password-hashing algorithm.
+
+---
+
+## MCrypt.Hash.SHA512
+
+SHA-384 and SHA-512.
+
+Based on FIPS 180-4.
+
+| Method | Signature | Output |
+|---|---|---|
+| `SHA512` | `(message: string, salt?: string) > hex` | 64 bytes / 512-bit |
+| `SHA384` | `(message: string, salt?: string) > hex` | 48 bytes / 384-bit |
+
+```lua
+local SHA512 = MCrypt.Hash.SHA512
+
+print(SHA512.SHA512("Hello World!"))
+print(SHA512.SHA384("Hello World!"))
+```
+
+---
+
+## MCrypt.Hash.SHA3
+
+SHA-3 and SHAKE based on Keccak-f[1600] and FIPS 202.
+
+| Method | Signature | Output |
+|---|---|---|
+| `SHA3_224` | `(message: string) > hex` | 28 bytes |
+| `SHA3_256` | `(message: string) > hex` | 32 bytes |
+| `SHA3_384` | `(message: string) > hex` | 48 bytes |
+| `SHA3_512` | `(message: string) > hex` | 64 bytes |
+| `SHAKE128` | `(message: string, outputBytes: integer) > hex` | Variable |
+| `SHAKE256` | `(message: string, outputBytes: integer) > hex` | Variable |
 
 ```lua
 local SHA3 = MCrypt.Hash.SHA3
 
 print(SHA3.SHA3_256("Hello World!"))
 print(SHA3.SHA3_512("Hello World!"))
-
--- SHAKE: pick any output length you need, e.g. a 16-byte token
 print(SHA3.SHAKE128("Hello World!", 16))
 print(SHA3.SHAKE256("Hello World!", 64))
 ```
 
-### MCrypt.Hash.BLAKE3
+`MCrypt.Hash.SHA3.Internal` contains lower-level Keccak/cSHAKE helpers used internally by KMAC.
 
-✅ Secure. The only `Hash` module that's instance/streaming-based. Supports 3 modes: default hash, keyed hash (`KEYED`) and key derivation (`DERIVE_KEY`). XOF output length is free.
+Those functions are internal implementation details and should not be treated as stable public API.
 
-**Instance (`MCrypt.Hash.BLAKE3(mode?, keyOrContext?)`)**
+---
 
-| Method | Signature | Description |
-|---|---|---|
-| `Constructor` | `(mode?: "KEYED"\|"DERIVE_KEY", keyOrContext?: string)` | No arguments: default mode. `"KEYED"` requires a 32-byte key. `"DERIVE_KEY"` takes a context string. |
-| `:Update` | `(data: string) > self` | Feeds the hasher (chainable, streaming). |
-| `:Digest` | `(outputBytes?: integer) > raw bytes` (default 32) | Finalizes. Does **not** invalidate the instance you can `:Update`/`:Digest` again afterward. |
-| `:Hex` | `(outputBytes?: integer) > hex` | Same as `Digest`, hex-encoded. |
+# MCrypt.Hash.BLAKE3
 
-**Static (one-shot)**
+BLAKE3 supports:
 
-| Method | Signature | Description |
-|---|---|---|
-| `BLAKE3.Hash` | `(data: string, outputBytes?: integer) > hex` | Default hash, one-shot. |
-| `BLAKE3.Keyed` | `(key: string[32 bytes], data: string, outputBytes?: integer) > hex` | Keyed hash, one-shot. |
-| `BLAKE3.DeriveKey` | `(context: string, keyMaterial: string, outputBytes?: integer) > hex` | Key derivation (KDF), one-shot. `context` should be a unique, application-specific constant string. |
+- standard hashing
+- keyed hashing
+- key derivation
+- streaming
+- extendable output
 
-```lua
--- Streaming
-local h = MCrypt.Hash.BLAKE3()
-h:Update("Hello "):Update("World!")
-print(h:Hex())
+It is also the only hash module in MCrypt designed around a persistent hasher instance.
 
--- One-shot
-print(MCrypt.Hash.BLAKE3.Hash("Hello World!"))
-```
-
-**More examples**:
+### Instance API
 
 ```lua
 local BLAKE3 = MCrypt.Hash.BLAKE3
-local Random = MCrypt.Utility.Random
-local Conversions = MCrypt.Utility.Conversions
+local hash = BLAKE3()
 
--- Keyed hash (needs a 32-byte key)
-local key = Random.Bytes(32)
-print(BLAKE3.Keyed(key, "Hello World!"))
+hash:Update("Hello ")
+hash:Update("World!")
 
--- Key derivation: turn a master secret into a purpose-specific subkey
-local masterSecret = Random.Bytes(32)
-local saveDataKey = Conversions.FromHex(
-	BLAKE3.DeriveKey("MyGame.SaveDataKey.v1", masterSecret)
-)
-print(#saveDataKey) -- 32 (ready to use as an Encrypt.AES/AEAD key)
-
--- XOF: ask for any output length you want
-print(BLAKE3.Hash("Hello World!", 64)) -- 64-byte hex digest instead of the default 32
+print(hash:Hex())
 ```
 
-### MCrypt.Hash.HMAC
+`Update` is chainable:
 
-✅ Secure MAC. RFC 2104 generic construction plus ready-made shortcuts.
+```lua
+hash:Update("Hello "):Update("World!")
+```
 
-| Method | Signature | Description |
-|---|---|---|
-| `Compute` | `(message: string, key: string, hashFn: function, blockSize: integer) > hex` | Generic HMAC with any hash function shaped `(message) > hex`. `blockSize` is the underlying hash's block size in bytes. |
-| `SHA256` / `SHA224` | `(message: string, key: string) > hex` | Shortcuts (block size 64 bytes). Key of any length works, a key ≥ block size is recommended for maximum strength. |
-| `SHA512` / `SHA384` | `(message: string, key: string) > hex` | Shortcuts (block size 128 bytes). |
+### One-shot API
 
-**Example**:
+```lua
+print(BLAKE3.Hash("Hello World!"))
+```
+
+### Keyed hashing
+
+```lua
+local Random = MCrypt.Utility.Random
+local key = Random.Bytes(32)
+
+print(BLAKE3.Keyed(key, "Hello World!"))
+```
+
+### Key derivation
+
+```lua
+local masterSecret = Random.Bytes(32)
+local derivedKeyHex = BLAKE3.DeriveKey("MyGame.SaveDataKey.v1", masterSecret)
+local derivedKey = MCrypt.Utility.Conversions.FromHex(derivedKeyHex)
+
+print(#derivedKey)
+-- 32
+```
+
+The context string should be a stable, application-specific identifier.
+
+For example:
+
+```text
+MyGame.SaveDataKey.v1
+MyGame.NetworkEncryption.v1
+MyGame.PlayerAuth.v1
+```
+
+Do not just use:
+
+```text
+"key"
+```
+
+and call it a day.
+
+---
+
+# MCrypt.Hash.HMAC
+
+HMAC implementation based on RFC 2104.
+
+Use HMAC when two parties share a secret and need to authenticate a message.
+
+| Method | Description |
+|---|---|
+| `Compute` | Generic HMAC construction. |
+| `SHA256` | HMAC-SHA256 shortcut. |
+| `SHA224` | HMAC-SHA224 shortcut. |
+| `SHA512` | HMAC-SHA512 shortcut. |
+| `SHA384` | HMAC-SHA384 shortcut. |
 
 ```lua
 local HMAC = MCrypt.Hash.HMAC
-
-print(HMAC.SHA256("The quick brown fox jumps over the lazy dog", "key"))
-print(HMAC.SHA512("The quick brown fox jumps over the lazy dog", "key"))
-
--- Generic form with a custom hash function (block size 64 for SHA-256-family hashes)
-print(HMAC.Compute("message", "key", MCrypt.Hash.SHA2.SHA256, 64))
-
--- Typical usage: verifying a message wasn't tampered with
 local sharedSecret = "server-only-secret"
 local payload = "player_id=42;gold=1000"
 local tag = HMAC.SHA256(payload, sharedSecret)
+local valid = HMAC.SHA256(payload, sharedSecret) == tag
 
--- ... send payload and tag together ...
-local isValid = HMAC.SHA256(payload, sharedSecret) == tag
-print(isValid) -- true
+print(valid)
+-- true
 ```
 
-### MCrypt.Hash.KMAC
+In a real protocol, make sure the authenticated data has an unambiguous encoding.
 
-✅ Secure MAC. NIST SP 800-185 a Keccak-native keyed MAC (not hash-then-MAC like HMAC).
+Do not casually concatenate fields like:
 
-| Method | Signature | Description |
-|---|---|---|
-| `KMAC128` | `(key: string, message: string, outputBytes?: integer, customization?: string) > hex` | Default output: 32 bytes (256-bit). `customization` is an optional domain-separation string. |
-| `KMAC256` | `(key: string, message: string, outputBytes?: integer, customization?: string) > hex` | Default output: 64 bytes (512-bit). |
+```text
+user .. amount .. timestamp
+```
 
-**Example**:
+without thinking about ambiguity and canonicalization.
+
+---
+
+# MCrypt.Hash.KMAC
+
+KMAC based on NIST SP 800-185.
+
+Unlike HMAC, KMAC is built directly on the Keccak family.
 
 ```lua
 local KMAC = MCrypt.Hash.KMAC
 
 print(KMAC.KMAC128("my key", "my message"))
 print(KMAC.KMAC256("my key", "my message", 32))
-
--- customization string: lets the same key produce independent MACs for
--- different purposes (domain separation) without needing separate keys
-local inviteTag = KMAC.KMAC128("guild-secret", "invite:42", 32, "GuildInvite")
-local kickTag = KMAC.KMAC128("guild-secret", "invite:42", 32, "GuildKick")
-print(inviteTag ~= kickTag)-- true, same key + message, different purpose
 ```
 
-### MCrypt.Hash.Poly1305
+### Customization / domain separation
 
-✅ Secure, but **strictly one-time-use**. RFC 8439.
+```lua
+local inviteTag = KMAC.KMAC128("guild-secret", "invite:42", 32, "GuildInvite")
+local kickTag = KMAC.KMAC128("guild-secret", "invite:42", 32, "GuildKick")
 
-⚠️ **Never reuse a key across two different messages** doing so completely breaks the security guarantee (an attacker can recover part of the key). This is why `Encrypt.AEAD` derives a fresh one-time key per message internally instead of letting you pass a long-term key directly.
+print(inviteTag ~= kickTag)
+-- true
+```
 
-| Method | Signature | Key size | Output size | Description |
-|---|---|---|---|---|
-| `Compute` | `(message: string, key: string[32 bytes]) > tag: string[16 bytes]` | 32 bytes / 256-bit | 16 bytes / 128-bit | Computes the tag. |
-| `Verify` | `(message: string, key: string[32 bytes], tag: string[16 bytes]) > boolean` | 32 bytes / 256-bit | - | Verifies a tag (short-circuit-resistant comparison). |
+Same key.
 
-**Example**:
+Same message.
+
+Different purpose.
+
+Different MAC.
+
+Crypto people call this domain separation.
+
+Normal people call it:
+
+> "Please don't accidentally use the same cryptographic context for everything."
+
+---
+
+# MCrypt.Hash.Poly1305
+
+Poly1305 is a one-time authenticator.
+
+Based on RFC 8439.
+
+## ⚠️ THE IMPORTANT PART
+
+**Never reuse a Poly1305 key for two different messages.**
+
+Don't.
+
+Seriously.
+
+It breaks the security guarantees of Poly1305 and can allow attackers to recover information about the key.
 
 ```lua
 local Poly1305 = MCrypt.Hash.Poly1305
 local Random = MCrypt.Utility.Random
-
--- Generate a FRESH one-time key, never reused for another message
 local oneTimeKey = Random.Bytes(32)
-local message = "this message is authenticated exactly once"
-
+local message = "authenticated exactly once"
 local tag = Poly1305.Compute(message, oneTimeKey)
-print(Poly1305.Verify(message, oneTimeKey, tag)) -- true
-print(Poly1305.Verify("tampered!", oneTimeKey, tag)) -- false
 
--- In practice, prefer Encrypt.AEAD which already uses Poly1305 correctly
--- (fresh one-time key per message) without you having to manage that yourself.
+print(Poly1305.Verify(message, oneTimeKey, tag))
+-- true
 ```
 
-### MCrypt.Hash.MD5
-
-❌ **Cryptographically broken.** Practical collision attacks are well-documented and cheap to run. Provided for legacy interop / non-security checksums **only** never for passwords, signatures or any integrity check you actually rely on.
-
-| Method | Signature | Output size | Description |
-|---|---|---|---|
-| `Compute` | `(message: string) > hex` | 16 bytes / 128-bit (32 hex chars) | MD5 digest. |
-
-**Example**:
+For normal application-level authenticated encryption, prefer:
 
 ```lua
--- Legacy interop example: matching a checksum produced by an old external
--- system that still uses MD5. Do NOT use this for anything security-related.
-print(MCrypt.Hash.MD5.Compute("Hello World!"))
--- "ed076287532e86365e841e92bfc50d8"
+MCrypt.Encrypt.AEAD
+```
+
+It handles the Poly1305 construction as part of ChaCha20-Poly1305.
+
+---
+
+# MCrypt.Hash.MD5
+
+## ❌ Broken for cryptographic security
+
+MD5 exists here for compatibility.
+
+That's it.
+
+Use it when an external legacy system says:
+
+> "Give me an MD5."
+
+Do not use it because:
+
+> "It's shorter."
+
+Do not use it for:
+
+- passwords
+- signatures
+- authentication
+- security-sensitive integrity
+
+```lua
+local MD5 = MCrypt.Hash.MD5
+
+print(MD5.Compute("Hello World!"))
+-- ed076287532e86365e841e92bfc50d8
 ```
 
 ---
 
-## MCrypt.Encrypt
+# MCrypt.Encrypt
 
-### MCrypt.Encrypt.ChaCha20
+## MCrypt.Encrypt.ChaCha20
 
-✅ Secure stream cipher, **no built-in authentication**. RFC 8439. `Encrypt`/`Decrypt` are the exact same operation.
+ChaCha20 is a modern stream cipher specified in RFC 8439.
 
-⚠️ **Never reuse the same (key, nonce) pair for two different messages** this completely breaks confidentiality (the keystream repeats and can be XORed out).
+It provides **confidentiality only**.
 
-| Method | Signature | Key size | Nonce size | Description |
-|---|---|---|---|---|
-| `Constructor` | `(key: string[32 bytes], nonce: string[12 bytes], counter?: integer)` | 32 bytes / 256-bit | 12 bytes / 96-bit | `counter` defaults to 0. |
-| `:Encrypt` / `:Decrypt` | `(data: string) > string` | - | - | XORs against the keystream (identical operation both ways). |
-| `ChaCha20.Once` | `(data: string, key: string[32], nonce: string[12], counter?: integer) > string` | 32 bytes | 12 bytes | One-shot helper. |
+It does not authenticate ciphertext.
 
-**Example**:
+### ⚠️ Never reuse `(key, nonce)`
+
+If you encrypt two different messages with the same key and nonce, the same keystream is reused.
+
+That's bad.
+
+Very bad.
+
+Use a unique nonce for every encryption under a given key.
+
+| Method | Signature |
+|---|---|
+| Constructor | `(key: string[32], nonce: string[12], counter?: integer)` |
+| `:Encrypt` | `(data: string) > string` |
+| `:Decrypt` | `(data: string) > string` |
+| `ChaCha20.Once` | `(data, key, nonce, counter?) > string` |
 
 ```lua
 local ChaCha20 = MCrypt.Encrypt.ChaCha20
 local Random = MCrypt.Utility.Random
-
 local key = Random.Bytes(32)
-local nonce = Random.Bytes(12) -- MUST be fresh for every message encrypted with this key
-
+local nonce = Random.Bytes(12)
 local cipher = ChaCha20(key, nonce)
 local ciphertext = cipher:Encrypt("Hello World!")
-
--- Decrypting needs a NEW instance with the SAME key/nonce/counter
 local plaintext = ChaCha20(key, nonce):Decrypt(ciphertext)
-print(plaintext) -- "Hello World!"
 
--- One-shot helper (equivalent to the above)
-local ciphertext2 = ChaCha20.Once("Hello World!", key, nonce)
-print(ChaCha20.Once(ciphertext2, key, nonce)) -- "Hello World!"
+print(plaintext)
+-- Hello World!
 ```
 
-### MCrypt.Encrypt.XOR
+`Encrypt` and `Decrypt` are the same operation for a stream cipher.
 
-❌ **Not cryptographically secure.** Trivially broken by frequency analysis and known-plaintext attacks. Light obfuscation only **never** use it for anything that actually needs to stay confidential. Use `AES` or `ChaCha20` (or `AEAD`) instead.
+---
 
-| Method | Signature | Key size | Description |
-|---|---|---|---|
-| `Constructor` | `(key: string)` | any non-empty length | |
-| `:Encrypt` / `:Decrypt` | `(data: string) > string` | - | Repeating-key XOR (identical operation both ways). |
-| `XOR.Once` | `(data: string, key: string) > string` | any non-empty length | One-shot helper. |
+# MCrypt.Encrypt.XOR
 
-**Example**:
+## ❌ This is not encryption.
+
+MCrypt includes repeating-key XOR because sometimes you need lightweight obfuscation.
+
+It can hide something from a casual glance.
+
+It cannot protect a secret from someone who actually cares.
 
 ```lua
 local XOR = MCrypt.Encrypt.XOR
+local encrypted = XOR("my-key"):Encrypt("not actually secret")
+local decrypted = XOR("my-key"):Decrypt(encrypted)
 
--- Fine for e.g. lightly obscuring a debug log or a non-sensitive config
--- value from a casual glance. NOT a security boundary.
-local obfuscated = XOR("my-key"):Encrypt("not actually secret")
-print(MCrypt.Utility.Conversions.ToHex(obfuscated))
-
-local restored = XOR("my-key"):Decrypt(obfuscated)
-print(restored) -- "not actually secret"
-
--- One-shot helper
-print(XOR.Once("hello", "key") == XOR.Once("hello", "key")) -- true (deterministic)
+print(decrypted)
+-- not actually secret
 ```
 
-### MCrypt.Encrypt.AES
+If the data actually matters:
 
-✅ Secure, **no built-in authentication**. AES-128/192/256 (FIPS-197), CBC (PKCS7-padded) and CTR modes.
+```text
+XOR ❌
+AES  ✅
+ChaCha20 ✅
+AEAD ✅✅
+```
 
-⚠️ IV/counter must never be reused with the same key. This module provides confidentiality only pair it with `Hash.HMAC` (encrypt-then-MAC) if you need tamper detection or use `Encrypt.AEAD` instead if you're starting fresh.
+---
 
-| Method | Signature | Key size | IV size | Description |
-|---|---|---|---|---|
-| `Constructor` | `(key: string[16\|24\|32 bytes], mode?: "CBC"\|"CTR")` | 16 / 24 / 32 bytes → AES-128 / 192 / 256 | - | `mode` defaults to `"CBC"`. |
-| `:EncryptCBC` | `(data: string, iv: string[16 bytes]) > ciphertext: string` | - | 16 bytes / 128-bit | Automatic PKCS7 padding. |
-| `:DecryptCBC` | `(data: string, iv: string[16 bytes]) > plaintext: string` | - | 16 bytes | Automatic PKCS7 unpadding. |
-| `:CryptCTR` | `(data: string, nonce: string[16 bytes]) > string` | - | 16 bytes | Symmetric (encrypt = decrypt). No padding. |
-| `:Encrypt` / `:Decrypt` | `(data: string, ivOrNonce: string[16 bytes]) > string` | - | 16 bytes | Dispatches to CBC or CTR based on the mode set at construction. |
-| `AES.GenerateIV` | `() > string[16 bytes]` | - | - | Random IV/nonce via `Utility.Random`. |
+# MCrypt.Encrypt.AES
 
-**Example**:
+AES-128, AES-192 and AES-256.
+
+Based on FIPS-197.
+
+Supported modes:
+
+- CBC
+- CTR
+
+### ⚠️ AES itself does not authenticate your data
+
+CBC and CTR provide confidentiality only.
+
+If an attacker can modify your ciphertext, raw AES does not tell you that it happened.
+
+For new designs, prefer:
+
+```lua
+MCrypt.Encrypt.AEAD
+```
+
+### Constructor
 
 ```lua
 local AES = MCrypt.Encrypt.AES
-local Random = MCrypt.Utility.Random
-local Conversions = MCrypt.Utility.Conversions
+local key = MCrypt.Utility.Random.Bytes(32)
+local cipher = AES(key, "CBC")
+```
 
-local key = Random.Bytes(32) -- AES-256
+### CBC
 
--- CBC mode
+CBC automatically applies PKCS#7 padding.
+
+```lua
 local iv = AES.GenerateIV()
-local cbc = AES(key, "CBC")
-local ciphertext = cbc:EncryptCBC("Hello World!", iv)
+local ciphertext =cipher:EncryptCBC("Hello World!", iv)
+local plaintext = cipher:DecryptCBC(ciphertext, iv)
 
-print(Conversions.ToHex(ciphertext))
-print(cbc:DecryptCBC(ciphertext, iv)) -- "Hello World!"
+print(plaintext)
+-- Hello World!
+```
 
--- CTR mode (no padding, streamable)
+### CTR
+
+CTR does not use padding.
+
+```lua
 local nonce = AES.GenerateIV()
 local ctr = AES(key, "CTR")
 local encrypted = ctr:CryptCTR("Hello World!", nonce)
-local decrypted = ctr:CryptCTR(encrypted, nonce) -- CTR decrypt == encrypt
-print(decrypted) -- "Hello World!"
+local decrypted = ctr:CryptCTR(encrypted, nonce)
 
--- Generic dispatch (uses whichever mode the instance was created with)
-print(cbc:Decrypt(cbc:Encrypt("test", iv), iv)) -- "test"
+print(decrypted)
+-- Hello World!
 ```
 
-### MCrypt.Encrypt.AEAD
+CTR encryption and decryption are the same operation.
 
-✅ **Secure recommended default for encryption.** ChaCha20-Poly1305 (RFC 8439 §2.8): confidentiality **and** integrity/authenticity in one call, with optional associated data (AAD) that is authenticated but not encrypted.
+### Generic API
 
-⚠️ Never reuse the same (key, nonce) pair for two different plaintexts same rule as raw ChaCha20.
+```lua
+local cipher = AES(key, "CBC")
+local encrypted = cipher:Encrypt("Hello World!", iv)
+local decrypted = cipher:Decrypt(encrypted, iv)
 
-| Method | Signature | Key size | Nonce size | Tag size | Description |
-|---|---|---|---|---|---|
-| `Encrypt` | `(plaintext: string, key: string[32], nonce: string[12], aad?: string) > ciphertext: string, tag: string[16]` | 32 bytes / 256-bit | 12 bytes / 96-bit | 16 bytes / 128-bit | |
-| `Decrypt` | `(ciphertext: string, tag: string[16], key: string[32], nonce: string[12], aad?: string) > plaintext?: string, error?: string` | 32 bytes | 12 bytes | 16 bytes | Returns `nil, "authentication failed"` if the tag doesn't match the ciphertext is **never** decrypted-and-returned on a failed check. |
+print(decrypted)
+-- Hello World!
+```
 
-**Example**:
+---
+
+# MCrypt.Encrypt.AEAD
+
+## ✅ Recommended encryption primitive
+
+MCrypt's AEAD module implements **ChaCha20-Poly1305** according to RFC 8439.
+
+AEAD provides:
+
+- confidentiality
+- integrity
+- authenticity
+- optional Additional Authenticated Data (AAD)
+
+all in one construction.
+
+This is generally what you want when you say:
+
+> "I need to encrypt some data and know if someone modified it."
+
+### ⚠️ Never reuse `(key, nonce)`
+
+Same rule as ChaCha20.
+
+A unique nonce is required for every message encrypted with the same key.
+
+```lua
+local AEAD = MCrypt.Encrypt.AEAD
+local Random = MCrypt.Utility.Random
+local key = Random.Bytes(32)
+local nonce = Random.Bytes(12)
+local ciphertext, tag =AEAD.Encrypt("Hello World!", key, nonce)
+local plaintext, err = AEAD.Decrypt(ciphertext, tag, key, nonce)
+
+print(plaintext)
+-- Hello World!
+```
+
+### Additional Authenticated Data
+
+AAD is authenticated but not encrypted.
+
+Useful for things such as:
+
+- message types
+- player IDs
+- protocol versions
+- packet headers
+
+```lua
+local aad = "player_id=42"
+local ciphertext, tag = AEAD.Encrypt("sensitive payload", key, nonce, aad)
+local plaintext, err = AEAD.Decrypt(ciphertext, tag, key, nonce, aad)
+
+print(plaintext)
+-- sensitive payload
+```
+
+If the ciphertext, tag, key, nonce or AAD is modified:
+
+```lua
+local plaintext, err = AEAD.Decrypt(ciphertext, tag, key, nonce, "player_id=99")
+
+print(plaintext)
+-- nil
+
+print(err)
+-- authentication failed
+```
+
+A failed authentication check does **not** return the unauthenticated plaintext.
+
+---
+
+# MCrypt.Encrypt.Cipher
+
+A unified facade allowing algorithms to be selected dynamically.
+
+Supported algorithms:
+
+```text
+AES
+ChaCha20
+XOR
+```
+
+The security properties are exactly those of the selected algorithm.
+
+In other words:
+
+```lua
+Cipher("XOR", ...)
+```
+
+does not magically make XOR secure.
+
+Nice try.
+
+```lua
+local Cipher = MCrypt.Encrypt.Cipher
+local cipher = Cipher("AES", key, "CBC")
+local encrypted = cipher:EncryptToHex("secret", iv)
+```
+
+---
+
+# MCrypt.Checksum
+
+Checksums are useful.
+
+They are also **not cryptography**.
+
+Do not use them to authenticate players or protect data against malicious modification.
+
+---
+
+## MCrypt.Checksum.CRC32
+
+CRC-32 / ISO-HDLC.
+
+Useful for detecting accidental corruption.
+
+```lua
+local CRC32 = MCrypt.Checksum.CRC32
+
+print(CRC32.Compute("The quick brown fox jumps over the lazy dog"))
+-- 414fa339
+```
+
+Do not use:
+
+```lua
+if CRC32.Compute(data) == expected then
+    playerIsNotHacking = true
+end
+```
+
+No.
+
+Please.
+
+---
+
+## MCrypt.Checksum.Adler32
+
+Adler-32 checksum commonly associated with zlib.
+
+```lua
+local Adler32 = MCrypt.Checksum.Adler32
+
+print(Adler32.Compute("Wikipedia"))
+-- 11e60398
+
+print(Adler32.ComputeRaw("Wikipedia"))
+-- 300286104
+```
+
+Again:
+
+> Accidental corruption detection ≠ cryptographic authentication.
+
+---
+
+# MCrypt.Sign
+
+## MCrypt.Sign.EdDSA
+
+MCrypt implements **Ed25519**, following RFC 8032.
+
+Ed25519 provides digital signatures.
+
+It is useful for:
+
+- player authentication
+- signed tokens
+- identity proofs
+- save-data integrity proofs
+- challenge-response authentication
+
+### Key sizes
+
+| Item | Size |
+|---|---:|
+| Seed | 32 bytes |
+| Public key | 32 bytes |
+| Private key | 64 bytes |
+| Signature | 64 bytes |
+
+The private key is stored as:
+
+```text
+seed || publicKey
+```
+
+### Generate a key
+
+```lua
+local EdDSA = MCrypt.Sign.EdDSA
+local publicKey, privateKey = EdDSA.GenerateKeypair()
+```
+
+Or use the OOP API:
+
+```lua
+local key = EdDSA.NewKey()
+local signature = key:Sign("Hello!")
+
+print(key:Verify("Hello!", signature))
+-- true
+```
+
+### Functional API
+
+```lua
+local publicKey, privateKey = EdDSA.GenerateKeypair()
+local signature = EdDSA.Sign("Hello World!", privateKey)
+
+print(EdDSA.Verify("Hello World!", signature, publicKey))
+-- true
+
+print(EdDSA.Verify("Tampered!", signature, publicKey))
+-- false
+```
+
+Ed25519 signatures are deterministic:
+
+```lua
+EdDSA.Sign(message, privateKey)
+```
+
+called twice with the same key and message produces the same signature.
+
+---
+
+# Player authentication with Ed25519
+
+One useful application is challenge-response authentication.
+
+The basic idea:
+
+1. Server generates a random challenge.
+2. Server sends the challenge to the client.
+3. Client signs the challenge with its private key.
+4. Client sends the signature back.
+5. Server verifies the signature against the registered public key.
+6. The challenge is invalidated.
+
+```lua
+-- Server
+
+local Random = MCrypt.Utility.Random
+local EdDSA = MCrypt.Sign.EdDSA
+local nonce = Random.Bytes(32)
+
+-- Send nonce to the client.
+-- The client signs it with its private key.
+```
+
+The client returns the signature:
+
+```lua
+local signature = EdDSA.Sign(nonce, privateKey)
+```
+
+The server verifies:
+
+```lua
+local valid = EdDSA.Verify(nonce, signature, registeredPublicKey)
+
+if valid then
+    print("Player authenticated!")
+else
+    print("Authentication failed.")
+end
+```
+
+### Why the nonce?
+
+Because signatures are otherwise replayable.
+
+If an attacker captures:
+
+```text
+message
++
+signature
+```
+
+and you accept that exact pair forever, they can simply send it again.
+
+A fresh, single-use challenge prevents that particular replay pattern.
+
+The challenge must be:
+
+- unpredictable enough for the protocol
+- associated with the authentication attempt
+- single-use
+- expired after a reasonable amount of time
+
+---
+
+# The "byte string" convention
+
+nanos world uses standard Lua strings rather than Luau's `buffer` type.
+
+Throughout MCrypt, a **byte string** means:
+
+> A normal Lua string where each character represents one byte.
+
+Lua strings are binary-safe.
+
+For example:
+
+```lua
+local data = string.char(0x00, 0xFF, 0x42)
+
+print(#data)
+-- 3
+```
+
+This is perfectly valid MCrypt input.
+
+Do not assume cryptographic functions operate on human-readable text.
+
+They operate on bytes.
+
+For example:
+
+```lua
+local key = MCrypt.Utility.Random.Bytes(32)
+```
+
+returns a 32-byte Lua string.
+
+If you want to display or store it in a text-oriented format:
+
+```lua
+local hex = MCrypt.Utility.Conversions.ToHex(key)
+```
+
+And to convert it back:
+
+```lua
+local key = MCrypt.Utility.Conversions.FromHex(hex)
+```
+
+### Common representations
+
+```text
+Lua byte string
+        ↓
+    ToHex()
+        ↓
+Hexadecimal string
+```
+
+or:
+
+```text
+Lua byte string
+        ↓
+    Base64.Encode()
+        ↓
+Base64 string
+```
+
+Hex and Base64 are representations.
+
+They do not provide encryption.
+
+---
+
+# Validation & test vectors
+
+MCrypt includes an integration validation suite covering the major cryptographic components.
+
+The validation suite checks APIs and known cryptographic vectors, including:
+
+- Random API
+- SHA-2
+- SHA-512 / SHA-384
+- SHA-3
+- BLAKE3
+- HMAC
+- KMAC
+- Poly1305
+- ChaCha20
+- ChaCha20-Poly1305
+- AES-128
+- AES-192
+- AES-256
+- AES-CBC
+- AES-CTR
+- Ed25519 / EdDSA it took me 10 hours without any break be gentle please :'(
+- CRC32
+- Adler32
+- encoding/conversion utilities
+- cross-module integration
+
+---
+
+# Limitations
+
+MCrypt is a Lua cryptographic framework for nanos world.
+
+It is **not** intended to replace mature, audited cryptographic libraries in environments where such libraries are available and appropriate.
+
+Important limitations include:
+
+### Randomness
+
+`Utility.Random` is a software PRNG and should not be advertised as a hardware/OS CSPRNG.
+
+### Password hashing
+
+Argon2, scrypt and bcrypt are not implemented.
+
+Do not use MCrypt's fast hashes for password storage.
+
+### Protocol design
+
+MCrypt provides primitives.
+
+It does not automatically make a protocol secure.
+
+You are still responsible for:
+
+- key management
+- nonce management
+- replay protection
+- authentication flow
+- key rotation
+- secret storage
+- message framing
+- canonicalization
+- access control
+
+### Client-side secrets
+
+Anything shipped to a client should generally be considered recoverable by that client.
+
+Do not put your server master key in client-side Lua and then be surprised when someone finds it.
+
+---
+
+# A sane default
+
+If you are starting a new project and simply want to encrypt authenticated data:
 
 ```lua
 local AEAD = MCrypt.Encrypt.AEAD
 local Random = MCrypt.Utility.Random
 
 local key = Random.Bytes(32)
-local nonce = Random.Bytes(12) -- MUST be fresh for every message encrypted with this key
+local nonce = Random.Bytes(12)
 
--- Without associated data
-local ciphertext, tag = AEAD.Encrypt("Hello World!", key, nonce)
+local ciphertext, tag = AEAD.Encrypt("sensitive data", key, nonce)
 local plaintext, err = AEAD.Decrypt(ciphertext, tag, key, nonce)
-print(plaintext) -- "Hello World!"
-
--- With associated data (authenticated but NOT encrypted, e.g. a player ID
--- or a message type that must travel in the clear but still be tamper-proof)
-local aad = "player_id=42"
-local ciphertext2, tag2 = AEAD.Encrypt("sensitive payload", key, nonce, aad)
-local plaintext2 = AEAD.Decrypt(ciphertext2, tag2, key, nonce, aad)
-print(plaintext2) -- "sensitive payload"
-
--- Tampering (wrong AAD, flipped bit, wrong tag...) always fails safely
-local _, failReason = AEAD.Decrypt(ciphertext2, tag2, key, nonce, "player_id=99")
-print(failReason) -- "authentication failed"
 ```
 
-### MCrypt.Encrypt.Cipher
-
-Unified facade over AES/ChaCha20/XOR for picking an algorithm dynamically by name. Security rating inherits from whichever algorithm you pick see the table above (i.e. `Cipher("XOR", ...)` is exactly as insecure as `Encrypt.XOR` on its own).
-
-| Method | Signature | Description |
-|---|---|---|
-| `Constructor` | `(algorithm: "AES"\|"ChaCha20"\|"XOR", ...)` | Extra arguments are forwarded to the chosen algorithm's constructor. |
-| `:Encrypt` / `:Decrypt` | `(data: string, ...) > string` | Delegates to the wrapped instance. |
-| `:EncryptToHex` | `(data: string, ...) > hex` | |
-| `:EncryptToBase64` | `(data: string, ...) > base64` | |
-
-```lua
-local cipher = MCrypt.Encrypt.Cipher("AES", key, "CBC")
-print(cipher:EncryptToHex("secret", iv))
-```
-
----
-
-## MCrypt.Checksum
-
-### MCrypt.Checksum.CRC32
-
-⚠️ **Not cryptographic.** CRC-32/ISO-HDLC (same variant used by ZIP, PNG, Ethernet). Designed to catch *accidental* corruption trivial for an adversary to forge on purpose. Do not use it as a security/integrity check against tampering.
-
-| Method | Signature | Output size | Description |
-|---|---|---|---|
-| `ComputeRaw` | `(data: string) > integer` | 32-bit integer | Raw checksum. |
-| `Compute` | `(data: string) > hex` | 4 bytes / 32-bit (8 hex chars) | |
-
-**Example**:
-
-```lua
-local CRC32 = MCrypt.Checksum.CRC32
-
-print(CRC32.Compute("The quick brown fox jumps over the lazy dog"))
--- "414fa339"
-
--- e.g. verifying a downloaded file wasn't accidentally corrupted in transit
-local received = "some downloaded content"
-local expectedChecksum = "a1b2c3d4" -- e.g. provided alongside the download
-print(CRC32.Compute(received) == expectedChecksum)
-```
-
-### MCrypt.Checksum.Adler32
-
-⚠️ **Not cryptographic.** Used by zlib. Same caveat as CRC32 accidental-corruption detection only.
-
-| Method | Signature | Output size | Description |
-|---|---|---|---|
-| `ComputeRaw` | `(data: string) > integer` | 32-bit integer | |
-| `Compute` | `(data: string) > hex` | 4 bytes / 32-bit (8 hex chars) | |
-
-**Example**:
-
-```lua
-local Adler32 = MCrypt.Checksum.Adler32
-
-print(Adler32.Compute("Wikipedia"))
--- "11e60398"
-
-print(Adler32.ComputeRaw("Wikipedia"))
--- 300286104
-```
-
----
-
-## MCrypt.Sign
-
-### MCrypt.Sign.EdDSA
-
-✅ Secure. Ed25519 (RFC 8032) recommended for player authentication (see the challenge-response pattern below) and any scenario needing tamper-evident, verifiable signatures.
-
-| Method | Signature | Sizes | Description |
-|---|---|---|---|
-| `GenerateKeypair` | `(seed?: string[32 bytes]) > publicKey: string[32], privateKey: string[64]` | seed 32 bytes, public key 32 bytes / 256-bit, private key 64 bytes | `seed` is random if omitted. `privateKey` = seed \|\| public key. |
-| `Sign` | `(message: string, privateKey: string[64]) > signature: string[64]` | signature 64 bytes / 512-bit | Deterministic (RFC 8032) signing the same message twice with the same key produces the same signature. |
-| `Verify` | `(message: string, signature: string[64], publicKey: string[32]) > boolean` | - | |
-| `NewKey` | `(seed?: string[32]) > EdDSAKey` | - | Generates a keypair and wraps it in an OOP instance. |
-
-**`EdDSAKey` instance**
-
-| Method | Signature | Description |
-|---|---|---|
-| `:Sign` | `(message: string) > signature: string[64]` | |
-| `:Verify` | `(message: string, signature: string[64]) > boolean` | |
-
-```lua
-local key = MCrypt.Sign.EdDSA.NewKey()
-local sig = key:Sign("Hello!")
-print(key:Verify("Hello!", sig)) -- true
-```
-
-**More examples**:
+If you need signatures:
 
 ```lua
 local EdDSA = MCrypt.Sign.EdDSA
-local Conversions = MCrypt.Utility.Conversions
-
--- Functional API (no OOP wrapper)
-local publicKey, privateKey = EdDSA.GenerateKeypair()
-local signature = EdDSA.Sign("Hello World!", privateKey)
-print(EdDSA.Verify("Hello World!", signature, publicKey)) -- true
-print(EdDSA.Verify("Tampered!", signature, publicKey)) -- false
-
--- Persisting keys: store as hex, reload later
-local publicKeyHex = Conversions.ToHex(publicKey)
-local privateKeyHex = Conversions.ToHex(privateKey)
-
--- ... save publicKeyHex / privateKeyHex somewhere (e.g. Package.SetPersistentData) ...
-local reloadedPrivateKey = Conversions.FromHex(privateKeyHex)
-print(EdDSA.Sign("test", reloadedPrivateKey) == EdDSA.Sign("test", privateKey)) -- true
+local key = EdDSA.NewKey()
+local signature = key:Sign("message")
+assert(key:Verify("message", signature))
 ```
 
-**Recommended pattern player authentication without storing passwords**: the server sends a random nonce (`Utility.Random.Bytes(32)`), the client signs it with a locally-stored private key (`Sign`) and returns the signature, the server verifies it against the player's registered public key (`Verify`). No secret is ever transmitted or stored server-side beyond a public key and the nonce is single-use, so intercepted signatures can't be replayed.
+If you need a hash:
 
 ```lua
--- Server side
-local Random = MCrypt.Utility.Random
-local Conversions = MCrypt.Utility.Conversions
-local EdDSA = MCrypt.Sign.EdDSA
+local digest = MCrypt.Hash.BLAKE3.Hash("message")
+```
 
-local nonce = Random.Bytes(32) -- send Conversions.ToHex(nonce) to the client
+If you need a MAC:
 
--- ... client signs it locally and sends back a hex signature ...
-local signature = Conversions.FromHex(receivedSignatureHex)
-local registeredPublicKey = Conversions.FromHex(playerPublicKeyHex) -- looked up by player ID
+```lua
+local tag = MCrypt.Hash.HMAC.SHA256("message", secretKey)
+```
 
-if EdDSA.Verify(nonce, signature, registeredPublicKey) then
-	print("Player authenticated!")
-else
-	print("Authentication failed, kicking player.")
-end
+And if you need to lightly obfuscate something that isn't secret:
+
+```lua
+local data = MCrypt.Encrypt.XOR("key"):Encrypt("not a secret")
 ```
 
 ---
 
-## The "byte string" convention
+# Final warning
 
-nanos world runs standard Lua (no Luau-style `buffer` type). Throughout this framework, a **byte string** means a regular Lua string where each character represents one byte (0-255) Lua strings are natively binary-safe, so this costs nothing extra. It's the direct equivalent of the `buffer` type used in Luau/Roblox reference implementations.
+Cryptography is one of those things where:
 
-Use `MCrypt.Utility.Conversions` to move between byte strings, hex and numeric byte arrays depending on what you need (storage, display, network transmission...).
+> "It works on my machine"
+
+is not a security audit.
+
+MCrypt is tested against known vectors and integration tests but the existence of tests does not mean that every possible protocol built on top of it is secure.
+
+Use the high-level primitive that matches your problem.
+
+Prefer:
+
+```text
+AEAD
+```
+
+over manually assembling:
+
+```text
+AES
++
+some hash
++
+some XOR
++
+a timestamp
++
+hope and faith
+```
+
+And please, for the love of everything that has ever been hashed:
+
+**do not roll your own cryptographic protocol unless you absolutely know why you are doing it.**
+
+---
+
+# License
+
+
+
+---
+
+Made with <3, questionable amounts of caffeine and an unhealthy relationship with bitwise operators.
+
+Feel free to dm me on nanos discord server if you want explains, lessons on cryptography or if you want an another modules here.
+
+**MCrypt, because `math.random()` was apparently not enough.**
